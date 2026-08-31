@@ -1,6 +1,6 @@
 # dsh-telegram
 
-**Telegram runtime adapter for DeepSeek Harness** — talk to your dsh agents from Telegram. Every allowed chat maps to one agent session; messages flow in via `followup()`, committed assistant text streams back to the chat. Zero runtime dependencies (plain HTTP over Node's built-in `fetch`).
+**Telegram runtime adapter for DeepSeek Harness** — talk to your dsh agents from Telegram. Every allowed chat maps to one agent session (or one session per Telegram forum topic when enabled); messages flow in via `followup()`, committed assistant text streams back to the chat. Zero runtime dependencies (plain HTTP over Node's built-in `fetch`).
 
 ## Overview
 
@@ -15,9 +15,9 @@ dsh-telegram turns a DeepSeek Harness agent into a Telegram bot. It is a *protoc
 **What it does**
 
 - Long-polls the Telegram Bot API (`getUpdates`) with no server, no webhook, no framework.
-- Creates one dsh agent session per allowed chat on first message; subsequent messages `followup()` into the same session, so conversation history is preserved.
+- Creates one dsh agent session per allowed chat on first message; when `topicsEnabled` is enabled, each Telegram forum topic (`message_thread_id`) in a chat gets its own session and context. Subsequent messages `followup()` into the same session.
 - Streams every committed assistant message back to the chat; long replies are split at Telegram's 4096-char limit.
-- Supports `/start`, `/new` (fresh session), `/status`.
+- Supports `/start`, `/new` (fresh chat/topic session), `/status`.
 - Rejects unauthorized users outright (configurable allowlist).
 
 **What it does not do (yet)**
@@ -32,7 +32,7 @@ dsh-telegram turns a DeepSeek Harness agent into a Telegram bot. It is a *protoc
 - Built and verified against `@deepseek-ai/dsh@0.1.0-rc.6` / `@deepseek-ai/cordis@^4.0.1`.
 - **Last verified:** 2026-08-13 against mainline commit of the same day (dsh repo `master`).
 - dsh is in developer preview and iterates rapidly. Pin your dsh version and re-verify after updates; the plugin's peer dependencies (`@deepseek-ai/dsh-agent`, `dsh-llm`, `dsh-session`) may change shape between RC releases.
-- Chat→session mapping lives in memory: restarting dsh loses open sessions (use `/new` to start a fresh one).
+- Chat/topic→session mapping lives in memory: restarting dsh loses open sessions (use `/new` to start a fresh one).
 
 ## Install / Uninstall
 
@@ -93,6 +93,7 @@ All keys live under the `dsh-telegram` row's `config` (patch layer; later layers
 | `model` | string | — | Model for created agents (falls back to profile default). |
 | `cwd` | string | `process.cwd()` | Working directory for created agent sessions. |
 | `pollTimeoutSeconds` | number | `25` | Long-poll timeout for `getUpdates` (Telegram max 50). |
+| `topicsEnabled` | boolean | `false` | Treat Telegram forum topics as separate sessions keyed by `message_thread_id`. Replies and typing indicators are sent back to the originating topic. |
 
 ## Permissions & data
 
@@ -129,7 +130,7 @@ Structure:
 Design notes for contributors:
 
 - **Zero runtime dependencies** is a goal: the Bot API surface used here is intentionally small (`getUpdates`, `sendMessage`, `sendChatAction`). Before adding a dependency, ask whether Node's built-ins cover it.
-- Session mapping is deliberately naive (one chat = one agent, in memory). A future version may key sessions by `(chat, bot)` or persist them; see Compatibility.
+- Session mapping is deliberately in-memory. By default, one chat = one agent; set `topicsEnabled: true` to use one `(chat, topic)` pair = one agent for Telegram forum topics. A future version may persist mappings; see Compatibility.
 
 ## License & security
 

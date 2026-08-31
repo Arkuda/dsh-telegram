@@ -33,6 +33,8 @@ export interface TelegramConfig {
   cwd?: string
   /** Long-poll timeout in seconds (Telegram max 50). */
   pollTimeoutSeconds?: number
+  /** Treat Telegram forum topics as separate sessions when message_thread_id is present. */
+  topicsEnabled?: boolean
 }
 
 export const Config: Schema<TelegramConfig> = Schema.object({
@@ -42,6 +44,7 @@ export const Config: Schema<TelegramConfig> = Schema.object({
   model: Schema.string(),
   cwd: Schema.string(),
   pollTimeoutSeconds: Schema.number().default(25),
+  topicsEnabled: Schema.boolean().default(false),
 })
 
 /** Max Telegram message length; longer replies are split on newline boundaries. */
@@ -61,14 +64,17 @@ interface TgUpdate {
 
 interface TgMessage {
   message_id: number
+  message_thread_id?: number
   chat: { id: number; type: string }
   from?: { id: number; first_name?: string; username?: string }
   text?: string
 }
 
-/** One Telegram chat mapped to one dsh agent session. */
+/** One Telegram chat/topic mapped to one dsh agent session. */
 interface ChatSession {
+  key: string
   chatId: number
+  threadId?: number
   agent: Agent
   dispose: () => Promise<void>
 }
@@ -99,10 +105,14 @@ export function splitLong(text: string, max = TG_MAX_MESSAGE): string[] {
   return parts
 }
 
+export function getSessionKey(chatId: number, threadId: number | undefined, topicsEnabled: boolean): string {
+  return topicsEnabled && threadId !== undefined ? `${chatId}:${threadId}` : `${chatId}`
+}
+
 export function apply(ctx: Context, config: TelegramConfig): void {
   const agents = ctx.agents
   const logger = ctx.logger
-  const sessions = new Map<number, ChatSession>()
+  const sessions = new Map<string, ChatSession>()
   let offset = 0
   let stopped = false
   let lastErrorAt = 0
@@ -117,19 +127,28 @@ export function apply(ctx: Context, config: TelegramConfig): void {
   const isAllowed = (userId: number | undefined): boolean =>
     userId !== undefined && config.allowedUserIds.includes(userId)
 
-  const sendText = (chatId: number, text: string): Promise<unknown> =>
+  const sendText = (chatId: number, text: string, threadId?: number): Promise<unknown> =>
     Promise.all(splitLong(text).map((part) =>
-      tgCall<unknown>(config.botToken, 'sendMessage', { chat_id: chatId, text: part })
+      tgCall<unknown>(config.botToken, 'sendMessage', {
+        chat_id: chatId,
+        text: part,
+        ...(threadId !== undefined ? { message_thread_id: threadId } : {}),
+      })
         .catch((error: unknown) => logger.warn(`dsh-telegram: sendMessage failed: ${String(error)}`)),
     ))
 
-  const typing = (chatId: number): void => {
-    void tgCall<unknown>(config.botToken, 'sendChatAction', { chat_id: chatId, action: 'typing' })
+  const typing = (chatId: number, threadId?: number): void => {
+    void tgCall<unknown>(config.botToken, 'sendChatAction', {
+      chat_id: chatId,
+      action: 'typing',
+      ...(threadId !== undefined ? { message_thread_id: threadId } : {}),
+    })
       .catch(() => undefined)
   }
 
-  const ensureSession = async (chatId: number): Promise<ChatSession> => {
-    const existing = sessions.get(chatId)
+  const ensureSession = async (chatId: number, threadId?: number): Promise<ChatSession> => {
+    const key = getSessionKey(chatId, threadId, config.topicsEnabled ?? false)
+    const existing = sessions.get(key)
     if (existing !== undefined) return existing
     const sessionId = SessionId(randomUUID())
     const agentOptions: Record<string, string> = {}
@@ -140,14 +159,23 @@ export function apply(ctx: Context, config: TelegramConfig): void {
       meta: { cwd: config.cwd ?? process.cwd() },
       agentOptions,
     })
-    const record: ChatSession = { chatId, agent: handle.agent, dispose: () => handle.dispose() }
-    sessions.set(chatId, record)
-    logger.info(`dsh-telegram: created agent ${sessionId} for chat ${chatId}`)
+    const record: ChatSession = {
+      key,
+      chatId,
+      threadId: config.topicsEnabled === true ? threadId : undefined,
+      agent: handle.agent,
+      dispose: () => handle.dispose(),
+    }
+    sessions.set(key, record)
+    logger.info(
+      `dsh-telegram: created agent ${sessionId} for chat ${chatId}` +
+      `${record.threadId !== undefined ? ` topic ${record.threadId}` : ''}`,
+    )
     return record
   }
 
   const disposeSession = async (record: ChatSession): Promise<void> => {
-    sessions.delete(record.chatId)
+    sessions.delete(record.key)
     await record.dispose()
   }
 
@@ -164,7 +192,7 @@ export function apply(ctx: Context, config: TelegramConfig): void {
           })
           .filter((part) => part.length > 0)
           .join('\n')
-        if (text.length > 0) void sendText(record.chatId, text)
+        if (text.length > 0) void sendText(record.chatId, text, record.threadId)
       }
     }
   })
@@ -174,7 +202,7 @@ export function apply(ctx: Context, config: TelegramConfig): void {
     for (const record of sessions.values()) {
       if (record.agent !== agent) continue
       const message = error instanceof Error ? error.message : String(error)
-      void sendText(record.chatId, `⚠️ Agent error: ${message}`)
+      void sendText(record.chatId, `⚠️ Agent error: ${message}`, record.threadId)
     }
   })
 
@@ -185,21 +213,24 @@ export function apply(ctx: Context, config: TelegramConfig): void {
         '🤖 Connected to DeepSeek Harness.\n\n' +
         'Send any message to talk to the agent. Commands:\n' +
         '/new — start a fresh session\n' +
-        '/status — show session info')
+        '/status — show session info',
+        record.threadId)
       return true
     }
     if (command === '/new') {
       await disposeSession(record)
-      const fresh = await ensureSession(record.chatId)
-      await sendText(record.chatId, '🔄 New session started.')
+      const fresh = await ensureSession(record.chatId, record.threadId)
+      await sendText(record.chatId, '🔄 New session started.', record.threadId)
       void fresh.agent
       return true
     }
     if (command === '/status') {
       await sendText(record.chatId,
         `Session: ${record.agent.session.id}\n` +
+        `Scope: ${record.threadId !== undefined ? `topic ${record.threadId}` : 'chat'}\n` +
         `Model: ${config.model ?? 'default'}\n` +
-        `Agent alive: ${ctx.agents.get(record.agent.id) === record.agent}`)
+        `Agent alive: ${ctx.agents.get(record.agent.id) === record.agent}`,
+        record.threadId)
       return true
     }
     return false
@@ -218,13 +249,14 @@ export function apply(ctx: Context, config: TelegramConfig): void {
           const message = update.message
           if (message === undefined || message.text === undefined) continue
           const chatId = message.chat.id
+          const threadId = config.topicsEnabled === true ? message.message_thread_id : undefined
           if (!isAllowed(message.from?.id)) {
-            void sendText(chatId, '⛔ You are not authorized to use this bot.')
+            void sendText(chatId, '⛔ You are not authorized to use this bot.', threadId)
             continue
           }
-          const record = await ensureSession(chatId)
+          const record = await ensureSession(chatId, threadId)
           if (await handleCommand(record, message.text)) continue
-          typing(chatId)
+          typing(chatId, threadId)
           const userMessage = createUserMessage({
             content: [{ type: 'text', text: message.text }],
             source: { kind: 'user' },
